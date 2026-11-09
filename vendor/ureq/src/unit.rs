@@ -407,30 +407,7 @@ fn send_prelude(unit: &Unit, stream: &mut Stream) -> io::Result<()> {
     // build into a buffer and send in one go.
     let mut prelude = PreludeBuilder::new();
 
-    let path = if let Some(proxy) = &unit.agent.config.proxy {
-        // HTTP proxies require the path to be in absolute URI form
-        // https://www.rfc-editor.org/rfc/rfc7230#section-5.3.2
-        match proxy.proto {
-            Proto::HTTP => match unit.url.port() {
-                Some(port) => format!(
-                    "{}://{}:{}{}",
-                    unit.url.scheme(),
-                    unit.url.host().unwrap(),
-                    port,
-                    unit.url.path()
-                ),
-                None => format!(
-                    "{}://{}{}",
-                    unit.url.scheme(),
-                    unit.url.host().unwrap(),
-                    unit.url.path()
-                ),
-            },
-            _ => unit.url.path().into(),
-        }
-    } else {
-        unit.url.path().into()
-    };
+    let path = request_path(&unit.agent, &unit.url);
 
     // request line
     prelude.write_request_line(&unit.method, &path, unit.url.query().unwrap_or_default())?;
@@ -482,6 +459,25 @@ fn send_prelude(unit: &Unit, stream: &mut Stream) -> io::Result<()> {
     stream.write_all(prelude.as_slice())?;
 
     Ok(())
+}
+
+fn request_path(agent: &Agent, url: &Url) -> String {
+    match agent.config.proxy.as_ref() {
+        // HTTP proxies require absolute-form for cleartext HTTP requests. HTTPS
+        // requests have already established a CONNECT tunnel here, so the
+        // request inside that tunnel must use origin-form.
+        Some(proxy) if proxy.proto == Proto::HTTP && url.scheme() == "http" => match url.port() {
+            Some(port) => format!(
+                "{}://{}:{}{}",
+                url.scheme(),
+                url.host().unwrap(),
+                port,
+                url.path()
+            ),
+            None => format!("{}://{}{}", url.scheme(), url.host().unwrap(), url.path()),
+        },
+        _ => url.path().into(),
+    }
 }
 
 fn is_header_sensitive(header: &Header) -> bool {
@@ -552,6 +548,58 @@ impl fmt::Display for PreludeBuilder {
             String::from_utf8_lossy(&self.prelude[pos..]).trim_end()
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentBuilder, Proxy};
+
+    fn request_line(agent: &Agent, url: &str) -> String {
+        let url = Url::parse(url).unwrap();
+        let mut prelude = PreludeBuilder::new();
+        prelude
+            .write_request_line(
+                "GET",
+                &request_path(agent, &url),
+                url.query().unwrap_or_default(),
+            )
+            .unwrap();
+        String::from_utf8(prelude.as_slice().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn cleartext_http_proxy_keeps_absolute_form() {
+        let agent = AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .proxy(Proxy::new("http://127.0.0.1:8080").unwrap())
+            .build();
+        assert_eq!(
+            request_line(&agent, "http://example.test:8081/usage?period=week"),
+            "GET http://example.test:8081/usage?period=week HTTP/1.1\r\n"
+        );
+    }
+
+    #[test]
+    fn https_http_proxy_uses_origin_form_after_connect() {
+        let agent = AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .proxy(Proxy::new("http://127.0.0.1:8080").unwrap())
+            .build();
+        assert_eq!(
+            request_line(&agent, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus?period=week"),
+            "GET /aiserver.v1.DashboardService/GetSandUsageStatus?period=week HTTP/1.1\r\n"
+        );
+    }
+
+    #[test]
+    fn request_without_proxy_uses_origin_form() {
+        let agent = AgentBuilder::new().try_proxy_from_env(false).build();
+        assert_eq!(
+            request_line(&agent, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus?period=week"),
+            "GET /aiserver.v1.DashboardService/GetSandUsageStatus?period=week HTTP/1.1\r\n"
+        );
     }
 }
 
